@@ -1,0 +1,1973 @@
+name: Nova Client Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.8
+
+      - name: Criar arquivos do projeto
+        run: |
+          cat > 'settings.gradle' <<'NOVA_EOF_MARKER'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          NOVA_EOF_MARKER
+          cat > 'gradle.properties' <<'NOVA_EOF_MARKER'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          # Minecraft 1.20.1
+          minecraft_version=1.20.1
+          yarn_mappings=1.20.1+build.10
+          loader_version=0.15.11
+
+          # Mod
+          mod_version=1.2.0
+          maven_group=com.novaclient
+          archives_base_name=novaclient
+
+          # Fabric API
+          fabric_version=0.92.2+1.20.1
+          NOVA_EOF_MARKER
+          cat > 'build.gradle' <<'NOVA_EOF_MARKER'
+          plugins {
+              id 'fabric-loom' version '1.6-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 17
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/HudRenderer.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.network.ClientPlayNetworkHandler;
+          import net.minecraft.client.network.PlayerListEntry;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.util.math.Direction;
+
+          import java.time.LocalTime;
+          import java.time.format.DateTimeFormatter;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.List;
+          import java.util.Locale;
+
+          /**
+           * Desenha o HUD (FPS, ping, coordenadas, CPS, armadura, minimapa, teclas, efeitos) em vermelho e branco.
+           */
+          public final class HudRenderer {
+              private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
+
+              private static final int RED = 0xFFE11D2E;
+              private static final int LABEL = 0xFFFF5A66;
+              private static final int WHITE = 0xFFFFFFFF;
+              private static final int BG = 0xB0121217;
+              private static final int GREEN = 0xFF55FF55;
+              private static final int YELLOW = 0xFFFFD84A;
+              private static final int WARN = 0xFFFF4D4D;
+
+              private static final int PAD = 5;
+              private static final int STRIPE = 2;
+              private static final int LINE_H = 11;
+              private static final int ARMOR_ROW_H = 18;
+              private static final int MARGIN = 4;
+              private static final int LABEL_GAP = 6;
+
+              /** Altura já ocupada em cada canto (para empilhar painéis sem sobrepor). */
+              private static final int[] CORNER_OFFSET = new int[4];
+
+              private static long windowStart = System.nanoTime();
+              private static int frames = 0;
+              private static int fps = 0;
+
+              private static final ArrayDeque<Long> LEFT_CLICKS = new ArrayDeque<>();
+              private static final ArrayDeque<Long> RIGHT_CLICKS = new ArrayDeque<>();
+              private static boolean lastAttack = false;
+              private static boolean lastUse = false;
+
+              private record Row(String label, String value) {
+              }
+
+              private HudRenderer() {
+              }
+
+              // ------------------------------------------------------------------ CPS
+
+              /** Chamado a cada tick: conta cliques (resolução de 20 Hz). */
+              public static void tickInput(MinecraftClient mc) {
+                  long now = System.currentTimeMillis();
+                  boolean atk = mc.currentScreen == null && mc.options.attackKey.isPressed();
+                  boolean use = mc.currentScreen == null && mc.options.useKey.isPressed();
+                  if (atk && !lastAttack) {
+                      LEFT_CLICKS.addLast(now);
+                  }
+                  if (use && !lastUse) {
+                      RIGHT_CLICKS.addLast(now);
+                  }
+                  lastAttack = atk;
+                  lastUse = use;
+                  prune(LEFT_CLICKS, now);
+                  prune(RIGHT_CLICKS, now);
+              }
+
+              private static void prune(ArrayDeque<Long> q, long now) {
+                  while (!q.isEmpty() && now - q.peekFirst() > 1000L) {
+                      q.pollFirst();
+                  }
+              }
+
+              // ------------------------------------------------------------------ render
+
+              public static void render(DrawContext ctx, float tickDelta) {
+                  updateFps();
+
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  NovaConfig cfg = NovaConfig.INSTANCE;
+
+                  if (!cfg.hudEnabled || mc.player == null || mc.world == null
+                          || mc.options.hudHidden || mc.options.debugEnabled) {
+                      return;
+                  }
+
+                  float scale = cfg.hudScalePercent / 100f;
+                  float vw = ctx.getScaledWindowWidth() / scale;
+                  float vh = ctx.getScaledWindowHeight() / scale;
+                  Arrays.fill(CORNER_OFFSET, 0);
+
+                  List<Row> rows = new ArrayList<>();
+                  if (cfg.showFps) {
+                      rows.add(new Row("FPS", String.valueOf(fps)));
+                  }
+                  if (cfg.showPing) {
+                      rows.add(new Row("PING", ping(mc)));
+                  }
+                  if (cfg.showCoords) {
+                      rows.add(new Row("XYZ", String.format(Locale.ROOT, "%.1f / %.1f / %.1f",
+                              mc.player.getX(), mc.player.getY(), mc.player.getZ())));
+                  }
+                  if (cfg.showDirection) {
+                      Direction facing = mc.player.getHorizontalFacing();
+                      rows.add(new Row("DIR", capitalize(facing.asString())));
+                  }
+                  if (cfg.showClock) {
+                      rows.add(new Row("HORA", LocalTime.now().format(CLOCK)));
+                  }
+                  if (cfg.showCps) {
+                      rows.add(new Row("CPS", LEFT_CLICKS.size() + " | " + RIGHT_CLICKS.size()));
+                  }
+                  if (cfg.autoSprint) {
+                      rows.add(new Row("SPRINT", "Auto"));
+                  }
+
+                  List<ItemStack> armor = cfg.showArmor ? armorItems(mc, cfg) : new ArrayList<>();
+                  boolean armorInside = cfg.armorCorner == 4;
+
+                  ctx.getMatrices().push();
+                  ctx.getMatrices().scale(scale, scale, 1f);
+
+                  // painel principal (com a armadura dentro, se configurado assim)
+                  drawPanel(ctx, mc, cfg, rows, armorInside ? armor : new ArrayList<>(), cfg.hudCorner, vw, vh, LABEL);
+
+                  // armadura em painel separado
+                  if (!armorInside && !armor.isEmpty()) {
+                      drawPanel(ctx, mc, cfg, new ArrayList<>(), armor, cfg.armorCorner, vw, vh, LABEL);
+                  }
+
+                  // minimapa
+                  if (cfg.minimapEnabled) {
+                      int size = cfg.minimapSize;
+                      int[] pos = place(cfg.minimapCorner, size + 2, size + 2, vw, vh);
+                      MinimapRenderer.draw(ctx, mc, pos[0] + 1, pos[1] + 1, size);
+                  }
+
+                  // efeitos de poção
+                  if (cfg.showEffects) {
+                      drawEffects(ctx, mc, cfg, vw, vh);
+                  }
+
+                  // teclas
+                  if (cfg.showKeystrokes) {
+                      drawKeys(ctx, mc, cfg, vw, vh);
+                  }
+
+                  ctx.getMatrices().pop();
+
+                  // waypoints no mundo (sem a escala do HUD)
+                  if (cfg.waypointsInWorld) {
+                      Waypoints.renderWorld(ctx, mc);
+                  }
+              }
+
+              // ------------------------------------------------------------------ painéis
+
+              private static int[] place(int corner, int w, int h, float vw, float vh) {
+                  boolean right = corner == 1 || corner == 3;
+                  boolean bottom = corner == 2 || corner == 3;
+                  int x = right ? Math.round(vw - w - MARGIN) : MARGIN;
+                  int y = bottom
+                          ? Math.round(vh - h - MARGIN - CORNER_OFFSET[corner])
+                          : MARGIN + CORNER_OFFSET[corner];
+                  CORNER_OFFSET[corner] += h + MARGIN;
+                  return new int[]{x, y};
+              }
+
+              private static void box(DrawContext ctx, int x, int y, int w, int h) {
+                  ctx.fill(x, y, x + w, y + h, BG);
+                  ctx.fill(x, y, x + STRIPE, y + h, RED);
+              }
+
+              private static void drawPanel(DrawContext ctx, MinecraftClient mc, NovaConfig cfg, List<Row> rows,
+                                            List<ItemStack> armor, int corner, float vw, float vh, int labelColor) {
+                  if (rows.isEmpty() && armor.isEmpty()) {
+                      return;
+                  }
+                  TextRenderer tr = mc.textRenderer;
+
+                  int labelW = 0;
+                  int valueW = 0;
+                  for (Row row : rows) {
+                      labelW = Math.max(labelW, tr.getWidth(row.label()));
+                      valueW = Math.max(valueW, tr.getWidth(row.value()));
+                  }
+                  int contentW = rows.isEmpty() ? 0 : labelW + LABEL_GAP + valueW;
+                  int[] as = armorSize(mc, armor, cfg);
+                  contentW = Math.max(contentW, as[0]);
+
+                  int boxW = STRIPE + PAD + contentW + PAD;
+                  int boxH = PAD * 2 - 1 + rows.size() * LINE_H + as[1];
+                  int[] pos = place(corner, boxW, boxH, vw, vh);
+                  int x = pos[0];
+                  int y = pos[1];
+
+                  box(ctx, x, y, boxW, boxH);
+
+                  int tx = x + STRIPE + PAD;
+                  int ty = y + PAD;
+                  for (Row row : rows) {
+                      ctx.drawTextWithShadow(tr, row.label(), tx, ty, labelColor);
+                      ctx.drawTextWithShadow(tr, row.value(), tx + labelW + LABEL_GAP, ty, WHITE);
+                      ty += LINE_H;
+                  }
+                  if (!armor.isEmpty()) {
+                      drawArmor(ctx, mc, cfg, armor, tx, ty);
+                  }
+              }
+
+              private static void drawEffects(DrawContext ctx, MinecraftClient mc, NovaConfig cfg, float vw, float vh) {
+                  List<Row> rows = new ArrayList<>();
+                  for (StatusEffectInstance e : mc.player.getStatusEffects()) {
+                      String name = e.getEffectType().getName().getString();
+                      if (e.getAmplifier() > 0) {
+                          name += " " + (e.getAmplifier() + 1);
+                      }
+                      rows.add(new Row(name, timeText(e.getDuration())));
+                  }
+                  drawPanel(ctx, mc, cfg, rows, new ArrayList<>(), cfg.effectsCorner, vw, vh, WHITE);
+              }
+
+              private static String timeText(int ticks) {
+                  if (ticks > 1_000_000) {
+                      return "--:--";
+                  }
+                  int s = ticks / 20;
+                  return String.format(Locale.ROOT, "%d:%02d", s / 60, s % 60);
+              }
+
+              private static void drawKeys(DrawContext ctx, MinecraftClient mc, NovaConfig cfg, float vw, float vh) {
+                  int cell = 18;
+                  int gap = 2;
+                  int w = cell * 3 + gap * 2;
+                  int h = cell * 3 + gap * 3 + 8;
+                  int[] pos = place(cfg.keysCorner, w, h, vw, vh);
+                  int x = pos[0];
+                  int y = pos[1];
+
+                  var o = mc.options;
+                  key(ctx, mc, x + cell + gap, y, cell, cell, "W", o.forwardKey.isPressed());
+                  int y2 = y + cell + gap;
+                  key(ctx, mc, x, y2, cell, cell, "A", o.leftKey.isPressed());
+                  key(ctx, mc, x + cell + gap, y2, cell, cell, "S", o.backKey.isPressed());
+                  key(ctx, mc, x + (cell + gap) * 2, y2, cell, cell, "D", o.rightKey.isPressed());
+
+                  int y3 = y2 + cell + gap;
+                  int half = (w - gap) / 2;
+                  key(ctx, mc, x, y3, half, cell, "L " + LEFT_CLICKS.size(), o.attackKey.isPressed());
+                  key(ctx, mc, x + half + gap, y3, w - half - gap, cell, "R " + RIGHT_CLICKS.size(), o.useKey.isPressed());
+
+                  key(ctx, mc, x, y3 + cell + gap, w, 8, "", o.jumpKey.isPressed());
+              }
+
+              private static void key(DrawContext ctx, MinecraftClient mc, int x, int y, int w, int h,
+                                      String label, boolean pressed) {
+                  ctx.fill(x, y, x + w, y + h, pressed ? RED : BG);
+                  if (!label.isEmpty()) {
+                      ctx.drawCenteredTextWithShadow(mc.textRenderer, label, x + w / 2, y + (h - 8) / 2, WHITE);
+                  }
+              }
+
+              // ------------------------------------------------------------------ armadura
+
+              private static List<ItemStack> armorItems(MinecraftClient mc, NovaConfig cfg) {
+                  List<ItemStack> list = new ArrayList<>();
+                  // slot 3 = capacete ... slot 0 = botas
+                  for (int slot = 3; slot >= 0; slot--) {
+                      ItemStack stack = mc.player.getInventory().getArmorStack(slot);
+                      if (!stack.isEmpty()) {
+                          list.add(stack);
+                      }
+                  }
+                  if (cfg.armorShowHands) {
+                      ItemStack main = mc.player.getMainHandStack();
+                      if (!main.isEmpty()) {
+                          list.add(main);
+                      }
+                      ItemStack off = mc.player.getOffHandStack();
+                      if (!off.isEmpty()) {
+                          list.add(off);
+                      }
+                  }
+                  return list;
+              }
+
+              private static String armorText(ItemStack s, int mode) {
+                  if (mode == 3) {
+                      return "";
+                  }
+                  if (s.isDamageable()) {
+                      int max = s.getMaxDamage();
+                      int left = max - s.getDamage();
+                      int pct = Math.round(left * 100f / max);
+                      return switch (mode) {
+                          case 0 -> String.valueOf(left);
+                          case 1 -> pct + "%";
+                          default -> left + " (" + pct + "%)";
+                      };
+                  }
+                  return s.getCount() > 1 ? "x" + s.getCount() : "";
+              }
+
+              private static int armorColor(ItemStack s, NovaConfig cfg) {
+                  if (!cfg.armorColorByDurability || !s.isDamageable()) {
+                      return WHITE;
+                  }
+                  float p = (s.getMaxDamage() - s.getDamage()) / (float) s.getMaxDamage();
+                  if (p > 0.6f) {
+                      return GREEN;
+                  }
+                  return p > 0.3f ? YELLOW : WARN;
+              }
+
+              private static int cellWidth(MinecraftClient mc, ItemStack s, NovaConfig cfg) {
+                  return Math.max(18, mc.textRenderer.getWidth(armorText(s, cfg.armorMode)) + 4);
+              }
+
+              /** Retorna {largura, altura} ocupadas pela lista de armadura. */
+              private static int[] armorSize(MinecraftClient mc, List<ItemStack> items, NovaConfig cfg) {
+                  if (items.isEmpty()) {
+                      return new int[]{0, 0};
+                  }
+                  if (!cfg.armorHorizontal) {
+                      int w = 0;
+                      for (ItemStack s : items) {
+                          String t = armorText(s, cfg.armorMode);
+                          w = Math.max(w, 18 + (t.isEmpty() ? 0 : mc.textRenderer.getWidth(t)));
+                      }
+                      return new int[]{w, items.size() * ARMOR_ROW_H};
+                  }
+                  int w = 0;
+                  for (ItemStack s : items) {
+                      w += cellWidth(mc, s, cfg);
+                  }
+                  int h = 18 + (cfg.armorMode == 3 ? 0 : 10);
+                  return new int[]{w, h};
+              }
+
+              private static void drawArmor(DrawContext ctx, MinecraftClient mc, NovaConfig cfg,
+                                            List<ItemStack> items, int x, int y) {
+                  TextRenderer tr = mc.textRenderer;
+                  if (!cfg.armorHorizontal) {
+                      for (ItemStack s : items) {
+                          ctx.drawItem(s, x, y);
+                          String t = armorText(s, cfg.armorMode);
+                          if (!t.isEmpty()) {
+                              ctx.drawTextWithShadow(tr, t, x + 18, y + 4, armorColor(s, cfg));
+                          }
+                          y += ARMOR_ROW_H;
+                      }
+                      return;
+                  }
+                  for (ItemStack s : items) {
+                      int cw = cellWidth(mc, s, cfg);
+                      ctx.drawItem(s, x + (cw - 16) / 2, y);
+                      String t = armorText(s, cfg.armorMode);
+                      if (!t.isEmpty()) {
+                          ctx.drawTextWithShadow(tr, t, x + (cw - tr.getWidth(t)) / 2, y + 18, armorColor(s, cfg));
+                      }
+                      x += cw;
+                  }
+              }
+
+              // ------------------------------------------------------------------ utilidades
+
+              private static void updateFps() {
+                  frames++;
+                  long now = System.nanoTime();
+                  if (now - windowStart >= 1_000_000_000L) {
+                      fps = frames;
+                      frames = 0;
+                      windowStart = now;
+                  }
+              }
+
+              private static String ping(MinecraftClient mc) {
+                  if (mc.isInSingleplayer()) {
+                      return "-";
+                  }
+                  ClientPlayNetworkHandler handler = mc.getNetworkHandler();
+                  if (handler == null || mc.player == null) {
+                      return "-";
+                  }
+                  PlayerListEntry entry = handler.getPlayerListEntry(mc.player.getUuid());
+                  return entry == null ? "-" : entry.getLatency() + " ms";
+              }
+
+              private static String capitalize(String s) {
+                  if (s.isEmpty()) {
+                      return s;
+                  }
+                  return Character.toUpperCase(s.charAt(0)) + s.substring(1);
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/MinimapRenderer.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import net.minecraft.block.BlockState;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.texture.NativeImage;
+          import net.minecraft.client.texture.NativeImageBackedTexture;
+          import net.minecraft.client.world.ClientWorld;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.world.Heightmap;
+          import net.minecraft.world.chunk.Chunk;
+          import net.minecraft.world.chunk.ChunkStatus;
+
+          /**
+           * Minimapa leve: amostra o terreno em baixa frequência para uma textura 64x64 e só a desenha na tela.
+           */
+          public final class MinimapRenderer {
+              public static final int TEX = 64;
+              private static final int REFRESH_TICKS = 8;
+              private static final int UNKNOWN = 0xFF14141A;
+
+              private static final Identifier ID = new Identifier("novaclient", "minimap");
+
+              private static NativeImageBackedTexture texture;
+              private static int ticks = 0;
+              private static int cells = 48;
+              private static int centerX = 0;
+              private static int centerZ = 0;
+
+              private static final int[] COLORS = new int[TEX * TEX];
+              private static final int[] HEIGHTS = new int[TEX * TEX];
+
+              private MinimapRenderer() {
+              }
+
+              private static void ensure(MinecraftClient mc) {
+                  if (texture == null) {
+                      texture = new NativeImageBackedTexture(TEX, TEX, true);
+                      mc.getTextureManager().registerTexture(ID, texture);
+                  }
+              }
+
+              public static void tick(MinecraftClient mc) {
+                  NovaConfig cfg = NovaConfig.INSTANCE;
+                  if (!cfg.minimapEnabled || mc.world == null || mc.player == null) {
+                      return;
+                  }
+                  if (cfg.minimapCells != cells) {
+                      ticks = REFRESH_TICKS;
+                  }
+                  if (++ticks < REFRESH_TICKS) {
+                      return;
+                  }
+                  ticks = 0;
+
+                  ensure(mc);
+                  NativeImage img = texture.getImage();
+                  if (img == null) {
+                      return;
+                  }
+
+                  cells = cfg.minimapCells;
+                  int half = cells / 2;
+                  int px = mc.player.getBlockX();
+                  int pz = mc.player.getBlockZ();
+                  int py = mc.player.getBlockY();
+                  centerX = px;
+                  centerZ = pz;
+
+                  ClientWorld world = mc.world;
+                  boolean ceiling = world.getDimension().hasCeiling();
+                  BlockPos.Mutable pos = new BlockPos.Mutable();
+
+                  // 1ª passada: cor base e altura
+                  for (int j = 0; j < cells; j++) {
+                      for (int i = 0; i < cells; i++) {
+                          int wx = px - half + i;
+                          int wz = pz - half + j;
+                          int idx = j * TEX + i;
+                          sample(world, wx, wz, py, ceiling, pos, idx);
+                      }
+                  }
+
+                  // 2ª passada: relevo (mais claro se for mais alto que o vizinho do norte) e gravação na imagem
+                  for (int j = 0; j < cells; j++) {
+                      for (int i = 0; i < cells; i++) {
+                          int idx = j * TEX + i;
+                          int rgb = COLORS[idx];
+                          float f = 1.0f;
+                          if (rgb != UNKNOWN && j > 0) {
+                              int north = HEIGHTS[idx - TEX];
+                              if (HEIGHTS[idx] > north) {
+                                  f = 1.15f;
+                              } else if (HEIGHTS[idx] < north) {
+                                  f = 0.85f;
+                              }
+                          }
+                          int r = Math.min(255, Math.round(((rgb >> 16) & 0xFF) * f));
+                          int g = Math.min(255, Math.round(((rgb >> 8) & 0xFF) * f));
+                          int b = Math.min(255, Math.round((rgb & 0xFF) * f));
+                          img.setColor(i, j, 0xFF000000 | (b << 16) | (g << 8) | r);
+                      }
+                  }
+                  texture.upload();
+              }
+
+              private static void sample(ClientWorld world, int wx, int wz, int py, boolean ceiling,
+                                         BlockPos.Mutable pos, int idx) {
+                  Chunk chunk = world.getChunk(wx >> 4, wz >> 4, ChunkStatus.FULL, false);
+                  if (chunk == null) {
+                      COLORS[idx] = UNKNOWN;
+                      HEIGHTS[idx] = py;
+                      return;
+                  }
+
+                  int bottom = world.getBottomY();
+                  int y;
+                  int maxScan;
+                  if (ceiling) {
+                      y = py;
+                      maxScan = 32;
+                  } else {
+                      y = chunk.sampleHeightmap(Heightmap.Type.WORLD_SURFACE, wx, wz);
+                      maxScan = 10;
+                  }
+
+                  int rgb = 0;
+                  for (int n = 0; n < maxScan && y >= bottom; n++, y--) {
+                      pos.set(wx, y, wz);
+                      BlockState state = chunk.getBlockState(pos);
+                      int color = state.getMapColor(world, pos).color;
+                      if (color != 0) {
+                          rgb = color;
+                          break;
+                      }
+                  }
+                  COLORS[idx] = rgb == 0 ? UNKNOWN : (0xFF000000 | rgb);
+                  HEIGHTS[idx] = y;
+              }
+
+              public static void draw(DrawContext ctx, MinecraftClient mc, int x, int y, int size) {
+                  NovaConfig cfg = NovaConfig.INSTANCE;
+                  if (texture == null || mc.player == null || mc.world == null) {
+                      return;
+                  }
+
+                  ctx.drawTexture(ID, x, y, size, size, 0f, 0f, cells, cells, TEX, TEX);
+
+                  double scale = size / (double) cells;
+                  double originX = centerX - cells / 2.0;
+                  double originZ = centerZ - cells / 2.0;
+
+                  // waypoints
+                  if (cfg.minimapWaypoints) {
+                      String d = Waypoints.dim(mc);
+                      for (NovaConfig.Waypoint wp : cfg.waypoints) {
+                          if (!d.equals(wp.dim)) {
+                              continue;
+                          }
+                          int sx = x + (int) Math.round((wp.x + 0.5 - originX) * scale);
+                          int sy = y + (int) Math.round((wp.z + 0.5 - originZ) * scale);
+                          sx = Math.max(x + 2, Math.min(x + size - 3, sx));
+                          sy = Math.max(y + 2, Math.min(y + size - 3, sy));
+                          ctx.fill(sx - 2, sy - 2, sx + 3, sy + 3, 0xFF000000);
+                          ctx.fill(sx - 1, sy - 1, sx + 2, sy + 2, wp.color);
+                      }
+                  }
+
+                  // outros jogadores
+                  if (cfg.minimapPlayers) {
+                      for (PlayerEntity p : mc.world.getPlayers()) {
+                          if (p == mc.player) {
+                              continue;
+                          }
+                          int sx = x + (int) Math.round((p.getX() - originX) * scale);
+                          int sy = y + (int) Math.round((p.getZ() - originZ) * scale);
+                          if (sx < x + 1 || sx > x + size - 2 || sy < y + 1 || sy > y + size - 2) {
+                              continue;
+                          }
+                          ctx.fill(sx - 1, sy - 1, sx + 2, sy + 2, 0xFFFFD84A);
+                      }
+                  }
+
+                  // você (branco) + direção (vermelho)
+                  int me = x + (int) Math.round((mc.player.getX() - originX) * scale);
+                  int mz = y + (int) Math.round((mc.player.getZ() - originZ) * scale);
+                  me = Math.max(x + 2, Math.min(x + size - 3, me));
+                  mz = Math.max(y + 2, Math.min(y + size - 3, mz));
+                  ctx.fill(me - 1, mz - 1, me + 2, mz + 2, 0xFFFFFFFF);
+                  double yaw = Math.toRadians(mc.player.getYaw());
+                  int tx = me + (int) Math.round(-Math.sin(yaw) * 4);
+                  int ty = mz + (int) Math.round(Math.cos(yaw) * 4);
+                  ctx.fill(tx, ty, tx + 1, ty + 1, 0xFFE11D2E);
+
+                  // borda vermelha + N
+                  int red = 0xFFE11D2E;
+                  ctx.fill(x - 1, y - 1, x + size + 1, y, red);
+                  ctx.fill(x - 1, y + size, x + size + 1, y + size + 1, red);
+                  ctx.fill(x - 1, y, x, y + size, red);
+                  ctx.fill(x + size, y, x + size + 1, y + size, red);
+                  ctx.drawCenteredTextWithShadow(mc.textRenderer, "N", x + size / 2, y + 2, 0xFFFFFFFF);
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/NovaClient.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.novaclient.mixin.MinecraftClientAccessor;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+          import net.fabricmc.fabric.api.client.screen.v1.Screens;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.TitleScreen;
+          import net.minecraft.client.gui.screen.GameMenuScreen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.entity.effect.StatusEffects;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          /**
+           * Nova Client - client leve para Fabric 1.20.1 (feito para rodar no Mojo Launcher).
+           */
+          public class NovaClient implements ClientModInitializer {
+              private static final String CATEGORY = "category.novaclient";
+              private static final String MENU_BUTTON_LABEL = "Nova";
+
+              private static KeyBinding menuKey;
+              private static KeyBinding zoomKey;
+              private static KeyBinding sprintKey;
+              private static KeyBinding fullbrightKey;
+              private static KeyBinding hudKey;
+              private static KeyBinding minimapKey;
+              private static KeyBinding waypointKey;
+
+              private static boolean zooming = false;
+              private static int savedFov = 70;
+              private static boolean nightVisionApplied = false;
+              private static boolean wasDead = false;
+
+              @Override
+              public void onInitializeClient() {
+                  NovaConfig.load();
+
+                  menuKey = register("key.novaclient.menu", GLFW.GLFW_KEY_RIGHT_SHIFT);
+                  zoomKey = register("key.novaclient.zoom", GLFW.GLFW_KEY_C);
+                  sprintKey = register("key.novaclient.sprint", GLFW.GLFW_KEY_V);
+                  fullbrightKey = register("key.novaclient.fullbright", GLFW.GLFW_KEY_B);
+                  hudKey = register("key.novaclient.hud", GLFW.GLFW_KEY_H);
+                  minimapKey = register("key.novaclient.minimap", GLFW.GLFW_KEY_M);
+                  waypointKey = register("key.novaclient.waypoint", GLFW.GLFW_KEY_N);
+
+                  HudRenderCallback.EVENT.register(HudRenderer::render);
+                  ClientTickEvents.END_CLIENT_TICK.register(NovaClient::onTick);
+
+                  // Ao entrar em um mundo/servidor, zera o estado do Fullbright
+                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> nightVisionApplied = false);
+
+                  // Garante que o FOV volta ao normal ao fechar o jogo com o zoom ativo
+                  ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+                      if (zooming) {
+                          client.options.getFov().setValue(savedFov);
+                          zooming = false;
+                      }
+                  });
+
+                  // /nova abre o menu; /nova wp add|del|list|clear gerencia waypoints
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                          dispatcher.register(ClientCommandManager.literal("nova")
+                                  .executes(ctx -> {
+                                      MinecraftClient mc = ctx.getSource().getClient();
+                                      // send() adia para o próximo tick, senão o chat fecha o menu logo em seguida
+                                      mc.send(() -> mc.setScreen(new NovaMenuScreen(null)));
+                                      return 1;
+                                  })
+                                  .then(ClientCommandManager.literal("wp")
+                                          .then(ClientCommandManager.literal("add")
+                                                  .then(ClientCommandManager.argument("nome", StringArgumentType.greedyString())
+                                                          .executes(ctx -> {
+                                                              MinecraftClient mc = ctx.getSource().getClient();
+                                                              String name = StringArgumentType.getString(ctx, "nome");
+                                                              NovaConfig.Waypoint w = Waypoints.addHere(mc, name);
+                                                              ctx.getSource().sendFeedback(Text.literal(w == null
+                                                                      ? "Entre em um mundo primeiro"
+                                                                      : "Waypoint criado: " + w.name));
+                                                              return 1;
+                                                          })))
+                                          .then(ClientCommandManager.literal("del")
+                                                  .then(ClientCommandManager.argument("nome", StringArgumentType.greedyString())
+                                                          .executes(ctx -> {
+                                                              MinecraftClient mc = ctx.getSource().getClient();
+                                                              String name = StringArgumentType.getString(ctx, "nome");
+                                                              boolean ok = Waypoints.remove(mc, name);
+                                                              ctx.getSource().sendFeedback(Text.literal(ok
+                                                                      ? "Waypoint apagado: " + name
+                                                                      : "Waypoint não encontrado: " + name));
+                                                              return ok ? 1 : 0;
+                                                          })))
+                                          .then(ClientCommandManager.literal("list")
+                                                  .executes(ctx -> {
+                                                      MinecraftClient mc = ctx.getSource().getClient();
+                                                      if (mc.world == null) {
+                                                          return 0;
+                                                      }
+                                                      String d = Waypoints.dim(mc);
+                                                      int count = 0;
+                                                      for (NovaConfig.Waypoint w : NovaConfig.INSTANCE.waypoints) {
+                                                          if (d.equals(w.dim)) {
+                                                              count++;
+                                                              ctx.getSource().sendFeedback(Text.literal(
+                                                                      w.name + ": " + w.x + " " + w.y + " " + w.z));
+                                                          }
+                                                      }
+                                                      if (count == 0) {
+                                                          ctx.getSource().sendFeedback(Text.literal("Nenhum waypoint neste mundo"));
+                                                      }
+                                                      return count;
+                                                  }))
+                                          .then(ClientCommandManager.literal("clear")
+                                                  .executes(ctx -> {
+                                                      MinecraftClient mc = ctx.getSource().getClient();
+                                                      int n = Waypoints.clear(mc);
+                                                      ctx.getSource().sendFeedback(Text.literal("Waypoints apagados: " + n));
+                                                      return n;
+                                                  })))));
+
+                  // Botão "Nova" no menu de pausa e na tela inicial (toque, sem precisar de teclado)
+                  ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
+                      if (screen instanceof GameMenuScreen || screen instanceof TitleScreen) {
+                          boolean already = Screens.getButtons(screen).stream()
+                                  .anyMatch(w -> w instanceof ButtonWidget
+                                          && MENU_BUTTON_LABEL.equals(w.getMessage().getString()));
+                          if (already) {
+                              return;
+                          }
+                          Screens.getButtons(screen).add(
+                                  ButtonWidget.builder(Text.literal(MENU_BUTTON_LABEL),
+                                                  b -> client.setScreen(new NovaMenuScreen(screen)))
+                                          .dimensions(4, 4, 56, 20)
+                                          .build());
+                      }
+                  });
+              }
+
+              private static KeyBinding register(String translationKey, int glfwKey) {
+                  return KeyBindingHelper.registerKeyBinding(
+                          new KeyBinding(translationKey, InputUtil.Type.KEYSYM, glfwKey, CATEGORY));
+              }
+
+              private static void onTick(MinecraftClient mc) {
+                  NovaConfig cfg = NovaConfig.INSTANCE;
+
+                  // --- Teclas ---
+                  while (menuKey.wasPressed()) {
+                      if (mc.currentScreen == null) {
+                          mc.setScreen(new NovaMenuScreen(null));
+                      }
+                  }
+                  while (hudKey.wasPressed()) {
+                      cfg.hudEnabled = !cfg.hudEnabled;
+                      NovaConfig.save();
+                      notice(mc, "HUD", cfg.hudEnabled);
+                  }
+                  while (sprintKey.wasPressed()) {
+                      cfg.autoSprint = !cfg.autoSprint;
+                      NovaConfig.save();
+                      notice(mc, "Auto Sprint", cfg.autoSprint);
+                  }
+                  while (fullbrightKey.wasPressed()) {
+                      cfg.fullbright = !cfg.fullbright;
+                      NovaConfig.save();
+                      notice(mc, "Fullbright", cfg.fullbright);
+                  }
+                  while (minimapKey.wasPressed()) {
+                      cfg.minimapEnabled = !cfg.minimapEnabled;
+                      NovaConfig.save();
+                      notice(mc, "Minimapa", cfg.minimapEnabled);
+                  }
+                  while (waypointKey.wasPressed()) {
+                      if (mc.currentScreen == null && mc.player != null && mc.world != null) {
+                          NovaConfig.Waypoint w = Waypoints.addHere(mc, Waypoints.nextName());
+                          if (w != null) {
+                              mc.player.sendMessage(Text.literal("Waypoint criado: " + w.name), true);
+                          }
+                      }
+                  }
+
+                  ClientPlayerEntity player = mc.player;
+
+                  // --- Zoom (segurar a tecla) ---
+                  boolean wantZoom = player != null && mc.currentScreen == null && zoomKey.isPressed();
+                  if (wantZoom && !zooming) {
+                      savedFov = mc.options.getFov().getValue();
+                      mc.options.getFov().setValue(cfg.zoomFov);
+                      zooming = true;
+                  } else if (!wantZoom && zooming) {
+                      mc.options.getFov().setValue(savedFov);
+                      zooming = false;
+                  }
+
+                  if (player == null) {
+                      return;
+                  }
+
+                  // --- CPS e minimapa ---
+                  HudRenderer.tickInput(mc);
+                  MinimapRenderer.tick(mc);
+
+                  // --- Hit Delay Fix: remove a espera de 10 ticks depois de errar um golpe ---
+                  if (cfg.hitDelayFix) {
+                      ((MinecraftClientAccessor) mc).novaSetAttackCooldown(0);
+                  }
+
+                  // --- Waypoint automático no local da morte ---
+                  boolean dead = player.isDead();
+                  if (dead && !wasDead && cfg.deathWaypoint && mc.world != null) {
+                      Waypoints.addHere(mc, "Morte");
+                  }
+                  wasDead = dead;
+
+                  // --- Auto Sprint ---
+                  if (cfg.autoSprint
+                          && !player.isSprinting()
+                          && player.input.movementForward > 0.8f
+                          && !player.isSneaking()
+                          && !player.isUsingItem()
+                          && !player.horizontalCollision
+                          && !player.isFallFlying()
+                          && !player.hasStatusEffect(StatusEffects.BLINDNESS)
+                          && player.getHungerManager().getFoodLevel() > 6) {
+                      player.setSprinting(true);
+                  }
+
+                  // --- Fullbright (efeito de visão noturna só no cliente, sem partículas/ícone) ---
+                  if (cfg.fullbright) {
+                      StatusEffectInstance current = player.getStatusEffect(StatusEffects.NIGHT_VISION);
+                      if (current == null || (nightVisionApplied && current.getDuration() < 400)) {
+                          player.addStatusEffect(new StatusEffectInstance(
+                                  StatusEffects.NIGHT_VISION, 100000, 0, false, false, false));
+                          nightVisionApplied = true;
+                      }
+                  } else if (nightVisionApplied) {
+                      player.removeStatusEffect(StatusEffects.NIGHT_VISION);
+                      nightVisionApplied = false;
+                  }
+              }
+
+              private static void notice(MinecraftClient mc, String name, boolean on) {
+                  if (mc.player != null) {
+                      mc.player.sendMessage(Text.literal(name + ": " + (on ? "ON" : "OFF")), true);
+                  }
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/NovaConfig.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /**
+           * Configuração salva em .minecraft/config/novaclient.json
+           */
+          public class NovaConfig {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              public static NovaConfig INSTANCE = new NovaConfig();
+
+              /** Waypoint salvo na config. */
+              public static class Waypoint {
+                  public String name = "WP";
+                  public int x, y, z;
+                  public String dim = "minecraft:overworld";
+                  public int color = 0xFFE11D2E;
+              }
+
+              // HUD
+              public boolean hudEnabled = true;
+              public boolean showFps = true;
+              public boolean showPing = true;
+              public boolean showCoords = true;
+              public boolean showDirection = true;
+              public boolean showClock = false;
+              public boolean showCps = true;
+
+              /** Tamanho do HUD em % (60 a 200). Em celular, 100-130 costuma ficar bom. */
+              public int hudScalePercent = 100;
+
+              /** 0 = topo-esquerda, 1 = topo-direita, 2 = baixo-esquerda, 3 = baixo-direita */
+              public int hudCorner = 0;
+
+              // Armadura
+              public boolean showArmor = true;
+              /** 0 = número, 1 = porcentagem, 2 = número + %, 3 = só ícone */
+              public int armorMode = 1;
+              /** 0-3 = cantos, 4 = dentro do painel do HUD */
+              public int armorCorner = 4;
+              public boolean armorHorizontal = false;
+              public boolean armorShowHands = false;
+              public boolean armorColorByDurability = true;
+
+              // Minimapa
+              public boolean minimapEnabled = true;
+              /** Tamanho na tela, em pixels (48 a 128). */
+              public int minimapSize = 64;
+              /** Quantidade de blocos mostrados por lado (32, 48 ou 64). */
+              public int minimapCells = 48;
+              public int minimapCorner = 1;
+              public boolean minimapPlayers = true;
+              public boolean minimapWaypoints = true;
+
+              // Waypoints
+              public boolean waypointsInWorld = true;
+              public boolean deathWaypoint = true;
+              public List<Waypoint> waypoints = new ArrayList<>();
+
+              // Módulos
+              public boolean autoSprint = true;
+              public boolean fullbright = false;
+              public boolean hitDelayFix = true;
+              public boolean showKeystrokes = false;
+              public int keysCorner = 2;
+              public boolean showEffects = false;
+              public int effectsCorner = 3;
+
+              /** FOV usado enquanto o zoom está ativo (30 a 110, menor = mais zoom). */
+              public int zoomFov = 30;
+
+              /** 0 = normal, 1 = equilibrado, 2 = máximo */
+              public int perfProfile = 0;
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("novaclient.json");
+              }
+
+              public static void load() {
+                  Path path = file();
+                  if (!Files.exists(path)) {
+                      save();
+                      return;
+                  }
+                  try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                      NovaConfig loaded = GSON.fromJson(reader, NovaConfig.class);
+                      if (loaded != null) {
+                          INSTANCE = loaded;
+                          INSTANCE.sanitize();
+                      }
+                  } catch (IOException | RuntimeException e) {
+                      System.err.println("[NovaClient] Falha ao ler config, usando padrão: " + e);
+                      INSTANCE = new NovaConfig();
+                  }
+              }
+
+              public static void save() {
+                  INSTANCE.sanitize();
+                  try {
+                      Files.createDirectories(file().getParent());
+                      try (Writer writer = Files.newBufferedWriter(file(), StandardCharsets.UTF_8)) {
+                          GSON.toJson(INSTANCE, writer);
+                      }
+                  } catch (IOException e) {
+                      System.err.println("[NovaClient] Falha ao salvar config: " + e);
+                  }
+              }
+
+              private void sanitize() {
+                  hudScalePercent = Math.max(60, Math.min(200, hudScalePercent));
+                  hudCorner = Math.floorMod(hudCorner, 4);
+                  zoomFov = Math.max(30, Math.min(110, zoomFov));
+                  armorMode = Math.floorMod(armorMode, 4);
+                  armorCorner = Math.floorMod(armorCorner, 5);
+                  minimapSize = Math.max(48, Math.min(128, minimapSize));
+                  minimapCells = Math.max(32, Math.min(64, minimapCells));
+                  minimapCorner = Math.floorMod(minimapCorner, 4);
+                  keysCorner = Math.floorMod(keysCorner, 4);
+                  effectsCorner = Math.floorMod(effectsCorner, 4);
+                  perfProfile = Math.floorMod(perfProfile, 3);
+                  if (waypoints == null) {
+                      waypoints = new ArrayList<>();
+                  }
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/NovaMenuScreen.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.sound.PositionedSoundInstance;
+          import net.minecraft.sound.SoundEvents;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.function.BooleanSupplier;
+          import java.util.function.Consumer;
+          import java.util.function.IntConsumer;
+          import java.util.function.IntSupplier;
+          import java.util.function.Supplier;
+
+          /**
+           * Menu do Nova Client: desenhado à mão (vermelho e branco), com abas e botões grandes para toque.
+           */
+          public class NovaMenuScreen extends Screen {
+              private static final int RED = 0xFFE11D2E;
+              private static final int RED_HOVER = 0xFFF2434F;
+              private static final int WHITE = 0xFFFFFFFF;
+              private static final int WHITE_SOFT = 0xFFFFE3E5;
+              private static final int GRAY = 0xFFA6A6B2;
+              private static final int PANEL = 0xF0121217;
+              private static final int TILE = 0xFF24242C;
+              private static final int TILE_HOVER = 0xFF30303A;
+              private static final int BORDER = 0xFF3A3A46;
+              private static final int DIM = 0x88000000;
+
+              private static final String[] TAB_NAMES = {"HUD", "Armadura", "Mapa", "Módulos", "Desempenho"};
+              private static final String[] CORNERS = {"Topo esq.", "Topo dir.", "Baixo esq.", "Baixo dir."};
+              private static final String[] ARMOR_POS = {"Topo esq.", "Topo dir.", "Baixo esq.", "Baixo dir.", "No HUD"};
+              private static final String[] ARMOR_MODES = {"Número", "Porcentagem", "Número + %", "Só ícone"};
+              private static final String[] ARMOR_LAYOUT = {"Vertical", "Horizontal"};
+              private static final String[] PROFILES = {"Normal", "Equilibrado", "Máximo"};
+              private static final int[] FPS_STEPS = {30, 60, 90, 120, 144, 260};
+
+              private static final int PAD = 8;
+              private static final int GAP = 5;
+              private static final int HEADER = 26;
+              private static final int TAB_H = 16;
+              private static final int FOOTER = 24;
+              private static final int STEP_W = 22;
+
+              private static int lastTab = 0;
+
+              private final Screen parent;
+              private final List<Tile> tiles = new ArrayList<>();
+
+              private int tab;
+              private int px, py, pw, ph;
+              private int tabY;
+              private int doneX, doneY, doneW;
+              private final int[] tabX = new int[TAB_NAMES.length];
+              private int tabW;
+
+              public NovaMenuScreen(Screen parent) {
+                  super(Text.literal("Nova Client"));
+                  this.parent = parent;
+              }
+
+              // ------------------------------------------------------------------ montagem das abas
+
+              @Override
+              protected void init() {
+                  tab = Math.max(0, Math.min(TAB_NAMES.length - 1, lastTab));
+                  rebuild();
+              }
+
+              private void rebuild() {
+                  NovaConfig c = NovaConfig.INSTANCE;
+                  tiles.clear();
+
+                  switch (tab) {
+                      case 0 -> {
+                          tiles.add(toggle("HUD", () -> c.hudEnabled, v -> c.hudEnabled = v));
+                          tiles.add(toggle("FPS", () -> c.showFps, v -> c.showFps = v));
+                          tiles.add(toggle("Ping", () -> c.showPing, v -> c.showPing = v));
+                          tiles.add(toggle("Coords", () -> c.showCoords, v -> c.showCoords = v));
+                          tiles.add(toggle("Direção", () -> c.showDirection, v -> c.showDirection = v));
+                          tiles.add(toggle("Relógio", () -> c.showClock, v -> c.showClock = v));
+                          tiles.add(toggle("CPS", () -> c.showCps, v -> c.showCps = v));
+                          tiles.add(stepper("Tamanho",
+                                  () -> c.hudScalePercent + "%",
+                                  () -> c.hudScalePercent = Math.max(60, c.hudScalePercent - 10),
+                                  () -> c.hudScalePercent = Math.min(200, c.hudScalePercent + 10)));
+                          tiles.add(cycle("Posição", CORNERS, () -> c.hudCorner, v -> c.hudCorner = v));
+                      }
+                      case 1 -> {
+                          tiles.add(toggle("Armadura", () -> c.showArmor, v -> c.showArmor = v));
+                          tiles.add(cycle("Modo", ARMOR_MODES, () -> c.armorMode, v -> c.armorMode = v));
+                          tiles.add(cycle("Posição", ARMOR_POS, () -> c.armorCorner, v -> c.armorCorner = v));
+                          tiles.add(cycle("Layout", ARMOR_LAYOUT,
+                                  () -> c.armorHorizontal ? 1 : 0, v -> c.armorHorizontal = v == 1));
+                          tiles.add(toggle("Itens nas mãos", () -> c.armorShowHands, v -> c.armorShowHands = v));
+                          tiles.add(toggle("Cor por durab.", () -> c.armorColorByDurability,
+                                  v -> c.armorColorByDurability = v));
+                      }
+                      case 2 -> {
+                          tiles.add(toggle("Minimapa", () -> c.minimapEnabled, v -> c.minimapEnabled = v));
+                          tiles.add(stepper("Tamanho",
+                                  () -> c.minimapSize + "px",
+                                  () -> c.minimapSize = Math.max(48, c.minimapSize - 16),
+                                  () -> c.minimapSize = Math.min(128, c.minimapSize + 16)));
+                          tiles.add(stepper("Alcance",
+                                  () -> "±" + (c.minimapCells / 2) + " blocos",
+                                  () -> c.minimapCells = Math.max(32, c.minimapCells - 16),
+                                  () -> c.minimapCells = Math.min(64, c.minimapCells + 16)));
+                          tiles.add(cycle("Posição", CORNERS, () -> c.minimapCorner, v -> c.minimapCorner = v));
+                          tiles.add(toggle("Jogadores", () -> c.minimapPlayers, v -> c.minimapPlayers = v));
+                          tiles.add(toggle("WP no mapa", () -> c.minimapWaypoints, v -> c.minimapWaypoints = v));
+                          tiles.add(toggle("WP no mundo", () -> c.waypointsInWorld, v -> c.waypointsInWorld = v));
+                          tiles.add(action("+ Waypoint aqui", () -> {
+                              NovaConfig.Waypoint w = Waypoints.addHere(client, Waypoints.nextName());
+                              message(w == null ? "Entre em um mundo primeiro" : "Waypoint criado: " + w.name);
+                          }));
+                          tiles.add(action("Apagar último", () -> {
+                              String name = Waypoints.removeLast(client);
+                              message(name == null ? "Nenhum waypoint aqui" : "Apagado: " + name);
+                          }));
+                      }
+                      case 3 -> {
+                          tiles.add(toggle("Auto Sprint", () -> c.autoSprint, v -> c.autoSprint = v));
+                          tiles.add(toggle("Fullbright", () -> c.fullbright, v -> c.fullbright = v));
+                          tiles.add(toggle("Hit Delay Fix", () -> c.hitDelayFix, v -> c.hitDelayFix = v));
+                          tiles.add(stepper("Zoom",
+                                  () -> String.format(Locale.ROOT, "%.1fx", 70f / c.zoomFov),
+                                  () -> c.zoomFov = Math.min(70, c.zoomFov + 10),
+                                  () -> c.zoomFov = Math.max(30, c.zoomFov - 10)));
+                          tiles.add(toggle("Teclas", () -> c.showKeystrokes, v -> c.showKeystrokes = v));
+                          tiles.add(cycle("Pos. teclas", CORNERS, () -> c.keysCorner, v -> c.keysCorner = v));
+                          tiles.add(toggle("Efeitos", () -> c.showEffects, v -> c.showEffects = v));
+                          tiles.add(cycle("Pos. efeitos", CORNERS, () -> c.effectsCorner, v -> c.effectsCorner = v));
+                          tiles.add(toggle("WP de morte", () -> c.deathWaypoint, v -> c.deathWaypoint = v));
+                      }
+                      default -> {
+                          tiles.add(stepper("Perfil",
+                                  () -> PROFILES[Math.floorMod(c.perfProfile, 3)],
+                                  () -> setProfile(c, c.perfProfile + 2),
+                                  () -> setProfile(c, c.perfProfile + 1)));
+                          tiles.add(stepper("Distância",
+                                  () -> client == null ? "-" : client.options.getViewDistance().getValue() + " chunks",
+                                  () -> {
+                                      if (client != null) {
+                                          int v = client.options.getViewDistance().getValue();
+                                          client.options.getViewDistance().setValue(Math.max(2, v - 2));
+                                          client.options.write();
+                                      }
+                                  },
+                                  () -> {
+                                      if (client != null) {
+                                          int v = client.options.getViewDistance().getValue();
+                                          client.options.getViewDistance().setValue(Math.min(16, v + 2));
+                                          client.options.write();
+                                      }
+                                  }));
+                          tiles.add(stepper("FPS máx.",
+                                  () -> {
+                                      if (client == null) {
+                                          return "-";
+                                      }
+                                      int v = client.options.getMaxFps().getValue();
+                                      return v >= 260 ? "Sem limite" : String.valueOf(v);
+                                  },
+                                  () -> stepFps(-1),
+                                  () -> stepFps(1)));
+                      }
+                  }
+
+                  layout();
+              }
+
+              private void setProfile(NovaConfig c, int value) {
+                  c.perfProfile = Math.floorMod(value, 3);
+                  if (client != null) {
+                      Performance.apply(client, c.perfProfile);
+                  }
+              }
+
+              private void stepFps(int dir) {
+                  if (client == null) {
+                      return;
+                  }
+                  int v = client.options.getMaxFps().getValue();
+                  int idx = FPS_STEPS.length - 1;
+                  for (int i = 0; i < FPS_STEPS.length; i++) {
+                      if (v <= FPS_STEPS[i]) {
+                          idx = i;
+                          break;
+                      }
+                  }
+                  idx = Math.max(0, Math.min(FPS_STEPS.length - 1, idx + dir));
+                  client.options.getMaxFps().setValue(FPS_STEPS[idx]);
+                  client.options.write();
+              }
+
+              private void message(String text) {
+                  if (client != null && client.player != null) {
+                      client.player.sendMessage(Text.literal(text), true);
+                  }
+              }
+
+              // ------------------------------------------------------------------ layout
+
+              private void layout() {
+                  int cols = width >= 330 ? 3 : 2;
+                  int rows = Math.max(1, (tiles.size() + cols - 1) / cols);
+
+                  pw = Math.min(width - 10, 440);
+                  int tileW = (pw - 2 * PAD - GAP * (cols - 1)) / cols;
+
+                  int top = HEADER + 4 + TAB_H + 6;
+                  int bottom = 4 + FOOTER + PAD;
+                  int avail = height - 8 - top - bottom;
+                  int tileH = Math.max(20, Math.min(40, (avail - GAP * (rows - 1)) / rows));
+
+                  ph = top + rows * tileH + (rows - 1) * GAP + bottom;
+                  px = (width - pw) / 2;
+                  py = Math.max(4, (height - ph) / 2);
+
+                  for (int i = 0; i < tiles.size(); i++) {
+                      Tile t = tiles.get(i);
+                      t.x = px + PAD + (i % cols) * (tileW + GAP);
+                      t.y = py + top + (i / cols) * (tileH + GAP);
+                      t.w = tileW;
+                      t.h = tileH;
+                  }
+
+                  int n = TAB_NAMES.length;
+                  tabW = (pw - 2 * PAD - 3 * (n - 1)) / n;
+                  tabY = py + HEADER + 4;
+                  for (int i = 0; i < n; i++) {
+                      tabX[i] = px + PAD + i * (tabW + 3);
+                  }
+
+                  doneX = px + PAD;
+                  doneW = pw - 2 * PAD;
+                  doneY = py + ph - PAD - FOOTER;
+              }
+
+              // ------------------------------------------------------------------ desenho
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  // fundo escurecido leve: dá para ver o HUD mudando ao fundo
+                  ctx.fill(0, 0, width, height, DIM);
+
+                  // painel
+                  rounded(ctx, px, py, px + pw, py + ph, PANEL);
+
+                  // cabeçalho vermelho
+                  rounded(ctx, px, py, px + pw, py + HEADER, RED);
+                  ctx.fill(px, py + HEADER - 4, px + pw, py + HEADER, RED);
+                  textLeft(ctx, "NOVA CLIENT", px + PAD, py + HEADER / 2f, 1.25f, WHITE, true);
+                  text(ctx, "1.20.1", px + pw - PAD, py + HEADER / 2f, 0.8f, WHITE_SOFT, false, true);
+
+                  // abas
+                  for (int i = 0; i < TAB_NAMES.length; i++) {
+                      boolean active = i == tab;
+                      boolean hover = inside(mouseX, mouseY, tabX[i], tabY, tabW, TAB_H);
+                      int bg = active ? RED : (hover ? TILE_HOVER : TILE);
+                      rounded(ctx, tabX[i], tabY, tabX[i] + tabW, tabY + TAB_H, bg);
+                      text(ctx, TAB_NAMES[i], tabX[i] + tabW / 2f, tabY + TAB_H / 2f, 0.8f,
+                              active ? WHITE : GRAY, active, false);
+                  }
+
+                  for (Tile t : tiles) {
+                      t.draw(ctx, mouseX, mouseY);
+                  }
+
+                  // botão PRONTO (branco com texto vermelho)
+                  boolean hoverDone = inside(mouseX, mouseY, doneX, doneY, doneW, FOOTER);
+                  rounded(ctx, doneX, doneY, doneX + doneW, doneY + FOOTER, hoverDone ? WHITE_SOFT : WHITE);
+                  text(ctx, "PRONTO", doneX + doneW / 2f, doneY + FOOTER / 2f, 1.1f, RED, true, false);
+
+                  super.render(ctx, mouseX, mouseY, delta);
+              }
+
+              private static boolean inside(double mx, double my, int x, int y, int w, int h) {
+                  return mx >= x && mx < x + w && my >= y && my < y + h;
+              }
+
+              /** Retângulo com cantos arredondados (sem sobreposição, funciona com cores translúcidas). */
+              private static void rounded(DrawContext c, int x1, int y1, int x2, int y2, int color) {
+                  c.fill(x1 + 2, y1, x2 - 2, y2, color);
+                  c.fill(x1 + 1, y1 + 1, x1 + 2, y2 - 1, color);
+                  c.fill(x2 - 2, y1 + 1, x2 - 1, y2 - 1, color);
+                  c.fill(x1, y1 + 2, x1 + 1, y2 - 2, color);
+                  c.fill(x2 - 1, y1 + 2, x2, y2 - 2, color);
+              }
+
+              /**
+               * Texto com escala, centralizado em x (ou terminando em x, se right for true).
+               * cy é o centro vertical do texto.
+               */
+              private void text(DrawContext ctx, String s, float x, float cy, float scale, int color,
+                                boolean bold, boolean right) {
+                  Text t = bold ? Text.literal(s).formatted(Formatting.BOLD) : Text.literal(s);
+                  int w = textRenderer.getWidth(t);
+                  drawScaled(ctx, t, x, cy, scale, color, right ? -w : -w / 2);
+              }
+
+              /** Texto com escala começando em x (alinhado à esquerda). */
+              private void textLeft(DrawContext ctx, String s, float x, float cy, float scale, int color, boolean bold) {
+                  Text t = bold ? Text.literal(s).formatted(Formatting.BOLD) : Text.literal(s);
+                  drawScaled(ctx, t, x, cy, scale, color, 0);
+              }
+
+              private void drawScaled(DrawContext ctx, Text t, float x, float cy, float scale, int color, int dx) {
+                  ctx.getMatrices().push();
+                  ctx.getMatrices().translate(x, cy, 0);
+                  ctx.getMatrices().scale(scale, scale, 1f);
+                  ctx.drawTextWithShadow(textRenderer, t, dx, -4, color);
+                  ctx.getMatrices().pop();
+              }
+
+              private void click() {
+                  if (client != null) {
+                      client.getSoundManager().play(PositionedSoundInstance.master(SoundEvents.UI_BUTTON_CLICK, 1.0f));
+                  }
+              }
+
+              // ------------------------------------------------------------------ entrada
+
+              @Override
+              public boolean mouseClicked(double mouseX, double mouseY, int button) {
+                  if (button == 0) {
+                      for (int i = 0; i < TAB_NAMES.length; i++) {
+                          if (inside(mouseX, mouseY, tabX[i], tabY, tabW, TAB_H)) {
+                              if (i != tab) {
+                                  NovaConfig.save();
+                                  tab = i;
+                                  lastTab = i;
+                                  rebuild();
+                              }
+                              click();
+                              return true;
+                          }
+                      }
+                      for (Tile t : tiles) {
+                          if (t.contains(mouseX, mouseY)) {
+                              t.click(mouseX);
+                              click();
+                              return true;
+                          }
+                      }
+                      if (inside(mouseX, mouseY, doneX, doneY, doneW, FOOTER)) {
+                          click();
+                          close();
+                          return true;
+                      }
+                  }
+                  return super.mouseClicked(mouseX, mouseY, button);
+              }
+
+              @Override
+              public void removed() {
+                  NovaConfig.save();
+              }
+
+              @Override
+              public void close() {
+                  if (client != null) {
+                      client.setScreen(parent);
+                  }
+              }
+
+              // ------------------------------------------------------------------ botões
+
+              private Tile toggle(String label, BooleanSupplier getter, Consumer<Boolean> setter) {
+                  return new Tile(label, getter, setter, null, null, null, null);
+              }
+
+              private Tile stepper(String label, Supplier<String> value, Runnable dec, Runnable inc) {
+                  return new Tile(label, null, null, value, dec, inc, null);
+              }
+
+              private Tile action(String label, Runnable run) {
+                  return new Tile(label, null, null, null, null, null, run);
+              }
+
+              /** Stepper que percorre uma lista de nomes. */
+              private Tile cycle(String label, String[] names, IntSupplier get, IntConsumer set) {
+                  int n = names.length;
+                  return stepper(label,
+                          () -> names[Math.floorMod(get.getAsInt(), n)],
+                          () -> set.accept(Math.floorMod(get.getAsInt() - 1, n)),
+                          () -> set.accept(Math.floorMod(get.getAsInt() + 1, n)));
+              }
+
+              private final class Tile {
+                  final String label;
+                  final BooleanSupplier getter;
+                  final Consumer<Boolean> setter;
+                  final Supplier<String> value;
+                  final Runnable dec;
+                  final Runnable inc;
+                  final Runnable action;
+                  int x, y, w, h;
+
+                  Tile(String label, BooleanSupplier getter, Consumer<Boolean> setter,
+                       Supplier<String> value, Runnable dec, Runnable inc, Runnable action) {
+                      this.label = label;
+                      this.getter = getter;
+                      this.setter = setter;
+                      this.value = value;
+                      this.dec = dec;
+                      this.inc = inc;
+                      this.action = action;
+                  }
+
+                  boolean contains(double mx, double my) {
+                      return inside(mx, my, x, y, w, h);
+                  }
+
+                  void click(double mx) {
+                      if (action != null) {
+                          action.run();
+                      } else if (getter != null) {
+                          setter.accept(!getter.getAsBoolean());
+                      } else if (mx < x + 3 + STEP_W) {
+                          dec.run();
+                      } else if (mx >= x + w - 3 - STEP_W) {
+                          inc.run();
+                      }
+                  }
+
+                  void draw(DrawContext ctx, int mx, int my) {
+                      boolean hover = contains(mx, my);
+                      float cx = x + w / 2f;
+                      float cy = y + h / 2f;
+
+                      if (action != null) {
+                          rounded(ctx, x, y, x + w, y + h, hover ? WHITE : RED);
+                          rounded(ctx, x + 1, y + 1, x + w - 1, y + h - 1, hover ? TILE_HOVER : TILE);
+                          text(ctx, label, cx, cy, 0.9f, WHITE, true, false);
+                          return;
+                      }
+
+                      if (getter != null) {
+                          boolean on = getter.getAsBoolean();
+                          int bg = on ? (hover ? RED_HOVER : RED) : (hover ? TILE_HOVER : TILE);
+                          int border = hover ? WHITE : (on ? RED : BORDER);
+                          rounded(ctx, x, y, x + w, y + h, border);
+                          rounded(ctx, x + 1, y + 1, x + w - 1, y + h - 1, bg);
+
+                          if (h >= 30) {
+                              text(ctx, label, cx, cy - 5, 1.0f, WHITE, on, false);
+                              text(ctx, on ? "ON" : "OFF", cx, cy + 8, 0.8f, on ? WHITE_SOFT : GRAY, false, false);
+                          } else {
+                              text(ctx, label + ": " + (on ? "ON" : "OFF"), cx, cy, 0.85f, on ? WHITE : GRAY, on, false);
+                          }
+                          return;
+                      }
+
+                      // stepper: [ - ]  valor  [ + ]
+                      rounded(ctx, x, y, x + w, y + h, BORDER);
+                      rounded(ctx, x + 1, y + 1, x + w - 1, y + h - 1, TILE);
+
+                      boolean hl = hover && mx < x + 3 + STEP_W;
+                      boolean hr = hover && mx >= x + w - 3 - STEP_W;
+                      rounded(ctx, x + 3, y + 3, x + 3 + STEP_W, y + h - 3, hl ? RED_HOVER : RED);
+                      rounded(ctx, x + w - 3 - STEP_W, y + 3, x + w - 3, y + h - 3, hr ? RED_HOVER : RED);
+                      text(ctx, "-", x + 3 + STEP_W / 2f, cy, 1.5f, WHITE, true, false);
+                      text(ctx, "+", x + w - 3 - STEP_W / 2f, cy, 1.5f, WHITE, true, false);
+
+                      String v = value.get();
+                      if (h >= 30) {
+                          text(ctx, label, cx, cy - 7, 0.7f, GRAY, false, false);
+                          text(ctx, v, cx, cy + 5, 0.9f, WHITE, true, false);
+                      } else {
+                          String s = label + ": " + v;
+                          float sc = 0.8f;
+                          int avail = w - 2 * (STEP_W + 6);
+                          if (textRenderer.getWidth(s) * sc > avail) {
+                              s = v;
+                          }
+                          text(ctx, s, cx, cy, sc, WHITE, true, false);
+                      }
+                  }
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/Performance.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.CloudRenderMode;
+          import net.minecraft.client.option.GameOptions;
+          import net.minecraft.client.option.GraphicsMode;
+          import net.minecraft.client.option.ParticlesMode;
+
+          /**
+           * Perfis de desempenho: ajustam as opções de vídeo do próprio jogo.
+           */
+          public final class Performance {
+              private Performance() {
+              }
+
+              public static void apply(MinecraftClient mc, int profile) {
+                  GameOptions o = mc.options;
+                  switch (profile) {
+                      case 2 -> {
+                          o.getViewDistance().setValue(6);
+                          o.getSimulationDistance().setValue(5);
+                          o.getGraphicsMode().setValue(GraphicsMode.FAST);
+                          o.getParticles().setValue(ParticlesMode.MINIMAL);
+                          o.getCloudRenderMode().setValue(CloudRenderMode.OFF);
+                          o.getEntityShadows().setValue(false);
+                          o.getBiomeBlendRadius().setValue(0);
+                          o.getEntityDistanceScaling().setValue(0.5);
+                      }
+                      case 1 -> {
+                          o.getViewDistance().setValue(8);
+                          o.getSimulationDistance().setValue(6);
+                          o.getGraphicsMode().setValue(GraphicsMode.FAST);
+                          o.getParticles().setValue(ParticlesMode.DECREASED);
+                          o.getCloudRenderMode().setValue(CloudRenderMode.FAST);
+                          o.getEntityShadows().setValue(false);
+                          o.getBiomeBlendRadius().setValue(1);
+                          o.getEntityDistanceScaling().setValue(0.75);
+                      }
+                      default -> {
+                          o.getViewDistance().setValue(12);
+                          o.getSimulationDistance().setValue(10);
+                          o.getGraphicsMode().setValue(GraphicsMode.FANCY);
+                          o.getParticles().setValue(ParticlesMode.ALL);
+                          o.getCloudRenderMode().setValue(CloudRenderMode.FANCY);
+                          o.getEntityShadows().setValue(true);
+                          o.getBiomeBlendRadius().setValue(2);
+                          o.getEntityDistanceScaling().setValue(1.0);
+                      }
+                  }
+                  o.write();
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient'
+          cat > 'src/main/java/com/novaclient/Waypoints.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.util.math.Vec3d;
+
+          import java.util.List;
+          import java.util.Locale;
+
+          /**
+           * Gerencia waypoints e desenha os marcadores no mundo.
+           */
+          public final class Waypoints {
+              private static final int[] PALETTE = {
+                      0xFFE11D2E, 0xFF3B82F6, 0xFF22C55E, 0xFFF59E0B,
+                      0xFFA855F7, 0xFF06B6D4, 0xFFEC4899, 0xFFFFFFFF
+              };
+
+              private Waypoints() {
+              }
+
+              public static String dim(MinecraftClient mc) {
+                  return mc.world.getRegistryKey().getValue().toString();
+              }
+
+              public static String nextName() {
+                  return "WP" + (NovaConfig.INSTANCE.waypoints.size() + 1);
+              }
+
+              public static NovaConfig.Waypoint addHere(MinecraftClient mc, String name) {
+                  if (mc.player == null || mc.world == null) {
+                      return null;
+                  }
+                  List<NovaConfig.Waypoint> list = NovaConfig.INSTANCE.waypoints;
+                  final String d = dim(mc);
+                  final String n = name;
+                  list.removeIf(w -> w.name != null && w.name.equalsIgnoreCase(n) && d.equals(w.dim));
+
+                  NovaConfig.Waypoint w = new NovaConfig.Waypoint();
+                  w.name = name;
+                  w.x = mc.player.getBlockX();
+                  w.y = mc.player.getBlockY();
+                  w.z = mc.player.getBlockZ();
+                  w.dim = d;
+                  w.color = PALETTE[list.size() % PALETTE.length];
+                  list.add(w);
+                  NovaConfig.save();
+                  return w;
+              }
+
+              public static boolean remove(MinecraftClient mc, String name) {
+                  if (mc.world == null) {
+                      return false;
+                  }
+                  final String d = dim(mc);
+                  final String n = name;
+                  boolean removed = NovaConfig.INSTANCE.waypoints
+                          .removeIf(w -> w.name != null && w.name.equalsIgnoreCase(n) && d.equals(w.dim));
+                  if (removed) {
+                      NovaConfig.save();
+                  }
+                  return removed;
+              }
+
+              public static String removeLast(MinecraftClient mc) {
+                  if (mc.world == null) {
+                      return null;
+                  }
+                  String d = dim(mc);
+                  List<NovaConfig.Waypoint> list = NovaConfig.INSTANCE.waypoints;
+                  for (int i = list.size() - 1; i >= 0; i--) {
+                      if (d.equals(list.get(i).dim)) {
+                          String name = list.remove(i).name;
+                          NovaConfig.save();
+                          return name;
+                      }
+                  }
+                  return null;
+              }
+
+              public static int clear(MinecraftClient mc) {
+                  if (mc.world == null) {
+                      return 0;
+                  }
+                  final String d = dim(mc);
+                  int before = NovaConfig.INSTANCE.waypoints.size();
+                  NovaConfig.INSTANCE.waypoints.removeIf(w -> d.equals(w.dim));
+                  NovaConfig.save();
+                  return before - NovaConfig.INSTANCE.waypoints.size();
+              }
+
+              public static String distanceText(double dist) {
+                  if (dist >= 1000) {
+                      return String.format(Locale.ROOT, "%.1fkm", dist / 1000.0);
+                  }
+                  return Math.round(dist) + "m";
+              }
+
+              /** Desenha os waypoints do mundo atual projetados na tela. */
+              public static void renderWorld(DrawContext ctx, MinecraftClient mc) {
+                  NovaConfig cfg = NovaConfig.INSTANCE;
+                  if (mc.world == null || mc.player == null || cfg.waypoints.isEmpty()) {
+                      return;
+                  }
+                  Camera cam = mc.gameRenderer.getCamera();
+                  if (!cam.isReady()) {
+                      return;
+                  }
+
+                  Vec3d cp = cam.getPos();
+                  double yaw = Math.toRadians(cam.getYaw());
+                  double pitch = Math.toRadians(cam.getPitch());
+                  double cosY = Math.cos(yaw);
+                  double sinY = Math.sin(yaw);
+                  double cosP = Math.cos(pitch);
+                  double sinP = Math.sin(pitch);
+
+                  // frente, direita e cima da câmera
+                  double fx = -sinY * cosP;
+                  double fy = -sinP;
+                  double fz = cosY * cosP;
+                  double rx = -cosY;
+                  double ry = 0;
+                  double rz = -sinY;
+                  double ux = ry * fz - rz * fy;
+                  double uy = rz * fx - rx * fz;
+                  double uz = rx * fy - ry * fx;
+
+                  int w = ctx.getScaledWindowWidth();
+                  int h = ctx.getScaledWindowHeight();
+                  double tanV = Math.tan(Math.toRadians(mc.options.getFov().getValue()) / 2.0);
+                  double tanH = tanV * ((double) w / (double) h);
+                  String d = dim(mc);
+
+                  for (NovaConfig.Waypoint wp : cfg.waypoints) {
+                      if (!d.equals(wp.dim)) {
+                          continue;
+                      }
+                      double dx = wp.x + 0.5 - cp.x;
+                      double dy = wp.y + 1.0 - cp.y;
+                      double dz = wp.z + 0.5 - cp.z;
+                      double zc = dx * fx + dy * fy + dz * fz;
+                      if (zc <= 0.1) {
+                          continue;
+                      }
+                      double xc = dx * rx + dy * ry + dz * rz;
+                      double yc = dx * ux + dy * uy + dz * uz;
+
+                      int screenX = (int) Math.round(w / 2.0 + (xc / zc) / tanH * (w / 2.0));
+                      int screenY = (int) Math.round(h / 2.0 - (yc / zc) / tanV * (h / 2.0));
+                      if (screenX < 4 || screenX > w - 4 || screenY < 10 || screenY > h - 10) {
+                          continue;
+                      }
+
+                      double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                      // marcador em cruz
+                      ctx.fill(screenX - 1, screenY - 3, screenX + 2, screenY + 4, wp.color);
+                      ctx.fill(screenX - 3, screenY - 1, screenX + 4, screenY + 2, wp.color);
+                      ctx.drawCenteredTextWithShadow(mc.textRenderer, wp.name + " " + distanceText(dist),
+                              screenX, screenY + 7, 0xFFFFFFFF);
+                  }
+              }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/java/com/novaclient/mixin'
+          cat > 'src/main/java/com/novaclient/mixin/MinecraftClientAccessor.java' <<'NOVA_EOF_MARKER'
+          package com.novaclient.mixin;
+
+          import net.minecraft.client.MinecraftClient;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.gen.Accessor;
+
+          @Mixin(MinecraftClient.class)
+          public interface MinecraftClientAccessor {
+              @Accessor("attackCooldown")
+              void novaSetAttackCooldown(int value);
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/resources'
+          cat > 'src/main/resources/fabric.mod.json' <<'NOVA_EOF_MARKER'
+          {
+            "schemaVersion": 1,
+            "id": "novaclient",
+            "version": "${version}",
+            "name": "Nova Client",
+            "description": "Client leve para celular (Mojo Launcher): HUD, armadura configuravel, minimapa, waypoints, hit delay fix, teclas, CPS e perfis de desempenho com menu touch.",
+            "authors": ["Nova"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.novaclient.NovaClient"]
+            },
+            "mixins": ["novaclient.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.14.21",
+              "minecraft": "~1.20.1",
+              "java": ">=17",
+              "fabric-api": "*"
+            }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/resources'
+          cat > 'src/main/resources/novaclient.mixins.json' <<'NOVA_EOF_MARKER'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "com.novaclient.mixin",
+            "compatibilityLevel": "JAVA_17",
+            "client": [
+              "MinecraftClientAccessor"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/resources/assets/novaclient/lang'
+          cat > 'src/main/resources/assets/novaclient/lang/en_us.json' <<'NOVA_EOF_MARKER'
+          {
+            "category.novaclient": "Nova Client",
+            "key.novaclient.menu": "Open Nova menu",
+            "key.novaclient.zoom": "Zoom (hold)",
+            "key.novaclient.sprint": "Toggle Auto Sprint",
+            "key.novaclient.fullbright": "Toggle Fullbright",
+            "key.novaclient.hud": "Toggle HUD",
+            "key.novaclient.minimap": "Toggle Minimap",
+            "key.novaclient.waypoint": "Add waypoint here"
+          }
+          NOVA_EOF_MARKER
+          mkdir -p 'src/main/resources/assets/novaclient/lang'
+          cat > 'src/main/resources/assets/novaclient/lang/pt_br.json' <<'NOVA_EOF_MARKER'
+          {
+            "category.novaclient": "Nova Client",
+            "key.novaclient.menu": "Abrir menu Nova",
+            "key.novaclient.zoom": "Zoom (segurar)",
+            "key.novaclient.sprint": "Alternar Auto Sprint",
+            "key.novaclient.fullbright": "Alternar Fullbright",
+            "key.novaclient.hud": "Alternar HUD",
+            "key.novaclient.minimap": "Alternar Minimapa",
+            "key.novaclient.waypoint": "Criar waypoint aqui"
+          }
+          NOVA_EOF_MARKER
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar do Nova Client
+        uses: actions/upload-artifact@v4
+        with:
+          name: novaclient-jar-v1-2
+          path: "build/libs/novaclient-*[0-9].jar"
+
+      - name: Montar pacote de mods (Nova + CIT Resewn + otimizacao)
+        run: |
+          mkdir -p pack/mods
+          cp build/libs/novaclient-*[0-9].jar pack/mods/
+          # mods baixados do Modrinth (1.20.1 / Fabric). Se algum falhar, o build continua.
+          for slug in fabric-api cit-resewn lithium ferrite-core modernfix entityculling dynamic-fps; do
+            url=$(curl -fsSL -A "nova-client-build" -G "https://api.modrinth.com/v2/project/$slug/version" \
+              --data-urlencode 'game_versions=["1.20.1"]' \
+              --data-urlencode 'loaders=["fabric"]' \
+              | jq -r '([.[] | select(.version_type=="release")] | (.[0].files // []) | (map(select(.primary))[0] // .[0]) | .url) // empty') || url=""
+            if [ -n "$url" ]; then
+              curl -fsSL -A "nova-client-build" -o "pack/mods/$slug.jar" "$url" && echo "OK: $slug" || echo "FALHOU: $slug"
+            else
+              echo "NAO ENCONTRADO: $slug"
+            fi
+          done
+          ls -la pack/mods
+          cd pack && zip -r ../nova-mods-1.20.1.zip mods
+
+      - name: Criar resource pack de exemplo (CIT Resewn)
+        run: |
+          d='pack/Nova-CIT/assets/minecraft/citresewn/cit/nova_sword'
+          mkdir -p "$d"
+          cat > pack/Nova-CIT/pack.mcmeta <<'NOVA_EOF_MARKER'
+          {
+            "pack": {
+              "pack_format": 15,
+              "description": "Nova CIT - exemplo (renomeie uma espada de diamante para nova)"
+            }
+          }
+          NOVA_EOF_MARKER
+          cat > "$d/nova_sword.properties" <<'NOVA_EOF_MARKER'
+          type=item
+          items=minecraft:diamond_sword
+          texture=nova_sword.png
+          nbt.display.Name=ipattern:*nova*
+          NOVA_EOF_MARKER
+          echo 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATklEQVR4nGNgGHngoaze//////8f1TysNLMgcypE5P4zMDAwyD26yMDIyMhIjAFM6JoZGBiI1oxiAAx0vHlEtGY4qBCR+4/sArIMIFcvAKSpPb6TVxF2AAAAAElFTkSuQmCC' | base64 -d > "$d/nova_sword.png"
+          cd pack && zip -r ../Nova-CIT.zip Nova-CIT
+
+      - name: Upload pacote de mods
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-mods-1-20-1
+          path: nova-mods-1.20.1.zip
+
+      - name: Upload resource pack CIT
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-cit-pack
+          path: Nova-CIT.zip
+
+      - name: Desativar workflow antigo
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow disable build.yml || true
